@@ -2994,11 +2994,13 @@ def print_job_verbose(job: dict, index: int, total: int):
 #  URL COLLECTION — GUEST API
 # =============================================================================
 
+GEO_ID = "2400553"
+
 def _build_guest_api_url(keyword: str, start: int) -> str:
     kw = quote_plus(keyword)
     return (
         "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-        f"?location=Gabon&f_TPR=r604800&keywords={kw}&start={start}"
+        f"?geoId={GEO_ID}&f_TPR=r604800&keywords={kw}&start={start}"
     )
 
 def _collect_job_urls_from_cards(html: str, seen: set) -> list:
