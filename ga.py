@@ -171,6 +171,54 @@ ATS_DOMAINS = [
     "oraclecloudhq.com","careers-page.com","applytojob.com",
 ]
 
+# =============================================================================
+#  ▶▶ GABON-ONLY LOCATION FILTER  (NEW)
+# =============================================================================
+#
+# The LinkedIn guest job-search API treats `location=Gabon` as a loose hint,
+# not a hard filter — when the strict match set is thin it backfills with
+# "similar" or unrelated results, including US listings whose state
+# abbreviation happens to collide with Gabon-related text (e.g. "GA" for
+# the U.S. state of Georgia). This filter is applied per-job, right after
+# each job's location is scraped, so nothing outside Gabon is ever kept,
+# paraphrased, or posted to WordPress — regardless of what the search API
+# returned.
+# =============================================================================
+
+GABON_LOCATION_KEYWORDS = [
+    "gabon", "libreville", "port-gentil", "port gentil", "franceville",
+    "oyem", "moanda", "lambaréné", "lambarene", "tchibanga", "mouila",
+    "bitam", "makokou", "koulamoutou", "ndende", "gamba", "mayumba",
+    "booué", "boue", "lastoursville", "mitzic", "mekambo",
+]
+
+# US state abbreviations LinkedIn sometimes leaks in when "Gabon" text-matching
+# falls back to broader/related results (e.g. "GA" = Georgia, USA).
+US_STATE_FALSE_POSITIVE_RE = re.compile(
+    r",\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|"
+    r"MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|"
+    r"UT|VT|VA|WA|WV|WI|WY)\b", re.I
+)
+
+def is_gabon_location(location_text: str) -> bool:
+    """
+    Return True only if the job's location clearly refers to Gabon.
+    Defensively rejects anything that looks like a US 'City, ST' pattern
+    (e.g. 'Columbus, GA', 'Atlanta, GA') even though 'GA' superficially
+    overlaps with Gabon-related text, and rejects explicit US/USA mentions.
+    """
+    if not location_text:
+        return False
+    text = location_text.strip().lower()
+
+    # Reject obvious US "City, ST" patterns outright
+    if US_STATE_FALSE_POSITIVE_RE.search(location_text):
+        return False
+    if re.search(r"\bunited states\b|\busa\b|\bu\.s\.a?\.?\b", text):
+        return False
+
+    return any(kw in text for kw in GABON_LOCATION_KEYWORDS)
+
 FAKE_LOCAL_RE  = re.compile(
     r"^(name|user|email|mail|yourname|your[-_.]?email|sample|test|info|hello"
     r"|noreply|no[-_.]?reply|admin|webmaster|support|contact|example)$", re.I)
@@ -2517,7 +2565,7 @@ def extract_experience(text: str) -> str:
     return ""
 
 # =============================================================================
-#  JOB DETAIL SCRAPER  (v7 + paraphrase)
+#  JOB DETAIL SCRAPER  (v7 + paraphrase + Gabon location gate)
 # =============================================================================
 
 def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) -> dict | None:
@@ -2564,6 +2612,23 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
     location       = sel_text(".topcard__flavor--bullet",
                                ".job-details-jobs-unified-top-card__bullet")
     workplace_type = get_workplace_type(soup)
+
+    # ── HARD LOCATION GATE: only keep jobs actually located in Gabon ─────────
+    # LinkedIn's guest search API treats `location=Gabon` as a loose hint and
+    # can backfill with unrelated results (e.g. US jobs whose state
+    # abbreviation is "GA" for Georgia). This check runs before any of the
+    # expensive company/deep-crawl/paraphrase/WordPress work below, so
+    # non-Gabon jobs are rejected immediately and never posted.
+    if not is_gabon_location(location):
+        print(C_RED(f"  ✗  Rejected — location '{location}' is not Gabon"))
+        log.info(f"Skipping non-Gabon job: '{title}' @ '{location}' ({job_url})")
+        _upsert_row(job_id, {
+            "Job URL": job_url, "Job Title": title,
+            "Status": f"failed|non_gabon_location:{location}",
+        })
+        processed_ids.add(job_id)
+        processed_urls.add(job_url)
+        return None
 
     time_el    = soup.find("time")
     raw_posted = (time_el.get("datetime", "") if time_el else "") or \
@@ -2994,11 +3059,23 @@ def print_job_verbose(job: dict, index: int, total: int):
 #  URL COLLECTION — GUEST API
 # =============================================================================
 
+# NOTE: `location=Gabon` is a free-text hint, not a hard filter — LinkedIn's
+# guest search backend can backfill with loosely-related or unrelated results
+# when the strict match set is thin (this is what caused US "GA" jobs to
+# appear). If you know Gabon's LinkedIn geoId, set it below to further narrow
+# the search results at the source. You can find it by browsing
+# linkedin.com/jobs with a Gabon location filter applied and copying the
+# `geoId=` value from the resulting URL. Leave as "" to skip this parameter —
+# the per-job is_gabon_location() gate in scrape_job_details() will still
+# enforce Gabon-only results either way.
+GABON_GEO_ID = ""   # e.g. "104081060" — optional, purely an extra narrowing hint
+
 def _build_guest_api_url(keyword: str, start: int) -> str:
     kw = quote_plus(keyword)
+    geo_param = f"&geoId={GABON_GEO_ID}" if GABON_GEO_ID else ""
     return (
         "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-        f"?location=Gabon&f_TPR=r604800&keywords={kw}&start={start}"
+        f"?location=Gabon{geo_param}&f_TPR=r604800&keywords={kw}&start={start}"
     )
 
 def _collect_job_urls_from_cards(html: str, seen: set) -> list:
@@ -3126,7 +3203,7 @@ def craw():
 
     print()
     print(C_HEADER("=" * 72))
-    print(C_HEADER("  LINKEDIN JOB SCRAPER v7 + MISTRAL PARAPHRASE"))
+    print(C_HEADER("  LINKEDIN JOB SCRAPER v7 + MISTRAL PARAPHRASE (GABON-ONLY)"))
     print(C_HEADER("=" * 72))
     print(f"  Keywords      : {len(SEARCH_KEYWORDS)}")
     print(f"  Max pages     : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
@@ -3134,6 +3211,7 @@ def craw():
     print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'} (skipped for Arabic descriptions)")
     print(f"  Apply/Website : ❌ LinkedIn URLs BLOCKED (blanked)")
     print(f"  Company URL   : ✅ LinkedIn company page URL KEPT")
+    print(f"  Location gate : ✅ Gabon-only (non-Gabon jobs, incl. US 'GA', are rejected)")
     print(f"  Logo priority : company-website logo > LinkedIn logo")
     print(f"  Company name  : LinkedIn page > job page > job-card > URL slug > website domain")
     print(f"  Email cleanup : known-TLD truncation (fixes '.comtak' style junk)")
@@ -3163,7 +3241,7 @@ def craw():
     print(C_HEADER(f"  Total unique URLs collected: {len(all_job_urls)}"))
     print()
 
-    jobs = []; errors = 0
+    jobs = []; errors = 0; rejected_non_gabon = 0
     for j, url in enumerate(all_job_urls):
         print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(all_job_urls)} ...')}")
         log.info(f"URL: {url}")
@@ -3191,7 +3269,7 @@ def craw():
                         mark_failed(job["_jobId"], "wp_post_failed")
                         print(C_RED("  ❌ WordPress post failed"))
             else:
-                print(C_RED("  ✗  No title found / skipped"))
+                print(C_RED("  ✗  No title found / skipped (may include non-Gabon rejections)"))
         except Exception as e:
             errors += 1
             print(C_RED(f"  ✗  ERROR: {e}"))
@@ -3203,16 +3281,25 @@ def craw():
 
     _save_excel(jobs)
 
+    # Count non-Gabon rejections from the tracker for the summary
+    try:
+        df_tracker = pd.read_csv(PROCESSED_IDS_FILE)
+        rejected_non_gabon = df_tracker["Status"].astype(str).str.contains(
+            "non_gabon_location", na=False).sum()
+    except Exception:
+        pass
+
     mins = round((time.time() - start_time) / 60, 1)
     print()
     print(C_HEADER("=" * 72))
     print(C_HEADER("  SCRAPE COMPLETE"))
     print(C_HEADER("=" * 72))
-    print(f"  {C_LABEL('Total scraped')}  : {C_GREEN(str(len(jobs)))} jobs")
-    print(f"  {C_LABEL('Errors')}         : {C_RED(str(errors)) if errors else '0'}")
-    print(f"  {C_LABEL('Duration')}       : ~{mins} min")
-    print(f"  {C_LABEL('Output file')}    : {OUTPUT_FILE}")
-    print(f"  {C_LABEL('Tracker file')}   : {PROCESSED_IDS_FILE}")
+    print(f"  {C_LABEL('Total scraped')}      : {C_GREEN(str(len(jobs)))} jobs")
+    print(f"  {C_LABEL('Rejected (non-Gabon)')}: {rejected_non_gabon}")
+    print(f"  {C_LABEL('Errors')}             : {C_RED(str(errors)) if errors else '0'}")
+    print(f"  {C_LABEL('Duration')}           : ~{mins} min")
+    print(f"  {C_LABEL('Output file')}        : {OUTPUT_FILE}")
+    print(f"  {C_LABEL('Tracker file')}       : {PROCESSED_IDS_FILE}")
 
     if jobs:
         from collections import Counter
