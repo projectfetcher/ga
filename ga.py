@@ -32,6 +32,47 @@ except ImportError:
     _NLP_AVAILABLE = False
 
 # =============================================================================
+#  ▶▶▶  COUNTRY / LOCATION FILTER  — CHANGE THIS TO REUSE FOR OTHER COUNTRIES
+#  ═════════════════════════════════════════════════════════════════════════
+#
+#  TARGET_COUNTRY controls BOTH:
+#    1) which location LinkedIn's guest search API is queried for, and
+#    2) which jobs actually get scraped/paraphrased/posted to WordPress
+#       (jobs whose "Location" text does not contain this string are
+#       skipped entirely — never posted).
+#
+#  Matching is case-insensitive substring matching against the job's
+#  location text (e.g. "Libreville, Gabon" contains "Gabon" → match).
+#
+#  TO REUSE THIS TEMPLATE FOR A DIFFERENT COUNTRY:
+#    Just change the value below. Nothing else in the script needs editing.
+#
+#  EXAMPLES:
+#    TARGET_COUNTRY = "Gabon"
+#    TARGET_COUNTRY = "United States"
+#    TARGET_COUNTRY = "United Kingdom"
+#    TARGET_COUNTRY = "France"
+#    TARGET_COUNTRY = ""              # empty = disable filtering, post ALL jobs
+#
+# =============================================================================
+
+TARGET_COUNTRY = "Gabon"   # 🌍 <<< CHANGE ONLY THIS LINE TO TARGET A DIFFERENT COUNTRY
+
+def matches_target_country(location: str) -> bool:
+    """
+    Case-insensitive substring check: does this job's location text
+    contain TARGET_COUNTRY?
+      - TARGET_COUNTRY == ""  → no filtering, always True
+      - location is empty     → always False (can't confirm country, reject)
+      - otherwise             → True only if TARGET_COUNTRY appears in location
+    """
+    if not TARGET_COUNTRY:
+        return True
+    if not location:
+        return False
+    return TARGET_COUNTRY.strip().lower() in location.strip().lower()
+
+# =============================================================================
 #  CONFIG
 # =============================================================================
 
@@ -43,8 +84,11 @@ MAX_PAGES       = 0   # 0 = unlimited
 MAX_EMPTY_PAGES = 5
 JOB_LIMIT       = 0   # 0 = no cap
 
-OUTPUT_FILE        = "jobs_output.xlsx"
-PROCESSED_IDS_FILE = "processed_jobs.csv"
+# Output/tracker files are named after TARGET_COUNTRY so different country
+# runs never overwrite each other's data.
+_country_slug       = re.sub(r"[^a-z0-9]+", "-", TARGET_COUNTRY.lower()).strip("-") or "all"
+OUTPUT_FILE         = f"jobs_output_{_country_slug}.xlsx"
+PROCESSED_IDS_FILE  = f"processed_jobs_{_country_slug}.csv"
 
 # ── WordPress (secrets via environment variables — see header docstring) ────
 WP_URL      = os.environ.get("WP_BASE_URL", "")
@@ -203,7 +247,7 @@ INDUSTRY_KEYWORDS = [
     ("Manufacturing", ["manufacturing","factory","industrial","production facility"]),
     ("Hospitality & Tourism", ["hospitality","hotel","tourism","travel agency","resort"]),
     ("Education", ["education","school","university","training institute","academy"]),
-    ("Logistics & Supply Chain", ["logistics","shipping","freight","transportation","supply chain"]),
+    ("Logistics & Transportation", ["logistics","shipping","freight","transportation","supply chain"]),
     ("Telecommunications", ["telecom","telecommunications","mobile network","internet service provider"]),
     ("Consulting", ["consulting","advisory","professional services"]),
     ("Media & Entertainment", ["media","entertainment","broadcasting","publishing","advertising agency"]),
@@ -224,59 +268,6 @@ def is_linkedin_url(value: str) -> bool:
 def blank_if_linkedin(value: str) -> str:
     """Return empty string if value contains a LinkedIn URL, else return as-is."""
     return "" if is_linkedin_url(value) else value
-
-# =============================================================================
-#  ▶▶ GABON-ONLY LOCATION FILTER
-# =============================================================================
-# LinkedIn's `location=Gabon` guest-API search parameter is sometimes matched
-# loosely, occasionally returning jobs based in the US state of Georgia (the
-# postal abbreviation "GA" collides with "Gabon") or other unrelated regions
-# (e.g. "Richmond, VA", "Greater Macon"). We only want jobs whose location
-# string genuinely ends in "Gabon".
-
-US_STATE_ABBREVIATIONS = {
-    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
-    "IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV",
-    "NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN",
-    "TX","UT","VT","VA","WA","WV","WI","WY","DC",
-}
-
-def is_gabon_location(location: str) -> bool:
-    """
-    True only if `location` genuinely refers to Gabon (the country in
-    Central Africa) — i.e. the string ends with the word "Gabon" — and is
-    not a US location (which sometimes slips through because "GA" is both
-    the postal abbreviation for Georgia, USA, and a loose substring match
-    LinkedIn's search can return).
-
-    Examples:
-        "Libreville, Estuaire Province, Gabon"  -> True
-        "Port-Gentil, Ogooué-Maritime Province, Gabon" -> True
-        "Gabon"                                 -> True
-        "Richmond, VA"                          -> False
-        "Greater Macon"                         -> False
-        "Atlanta, GA"                           -> False
-        "Libreville, Gabon, United States"      -> False (malformed/bad data)
-    """
-    if not location:
-        return False
-    loc = location.strip()
-    if not loc:
-        return False
-
-    # Explicit US markers anywhere in the string -> reject outright.
-    if re.search(r"\bunited\s+states\b|\bU\.?S\.?A?\.?\b", loc, re.I):
-        return False
-
-    parts = [p.strip() for p in loc.split(",") if p.strip()]
-    last  = parts[-1] if parts else loc
-
-    # A bare 2-letter token as the final segment is a US state code
-    # (e.g. "VA", "GA" for Georgia) — never a country name.
-    if len(last) == 2 and last.upper() in US_STATE_ABBREVIATIONS:
-        return False
-
-    return bool(re.search(r"\bgabon\b\s*$", last, re.I))
 
 # =============================================================================
 #  v7: BAD COMPANY NAME / LOGIN-WALL HELPERS
@@ -2570,13 +2561,15 @@ def extract_experience(text: str) -> str:
     return ""
 
 # =============================================================================
-#  JOB DETAIL SCRAPER  (v7 + paraphrase + Gabon-only filter)
+#  JOB DETAIL SCRAPER  (v7 + paraphrase + COUNTRY FILTER)
 # =============================================================================
 
 def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) -> dict | None:
     """
     Scrape a single LinkedIn job (v7 layers) then paraphrase key fields.
-    Returns the job dict or None.
+    Returns the job dict, or None if already processed, if it has no title,
+    or if its location doesn't match TARGET_COUNTRY (see matches_target_country
+    near the top of this file).
     """
     job_id = make_job_id(job_url)
     if job_id in processed_ids or job_url in processed_urls:
@@ -2618,13 +2611,14 @@ def scrape_job_details(job_url: str, processed_ids: set, processed_urls: set) ->
                                ".job-details-jobs-unified-top-card__bullet")
     workplace_type = get_workplace_type(soup)
 
-    # ── ▶▶ GABON-ONLY FILTER ────────────────────────────────────────────────
-    # Reject anything that isn't genuinely a Gabon-based listing (e.g. jobs
-    # that slipped in from the US state of Georgia or elsewhere) BEFORE
-    # spending time on company/deep-crawl/paraphrase work.
-    if not is_gabon_location(location):
-        log.info(f"Skipping non-Gabon job (location='{location}'): {title}")
-        print(C_DIM(f"  ⏭  Skipped — not Gabon (location='{location}'): {title}"))
+    # ▶▶ COUNTRY FILTER — reject anything whose location doesn't contain
+    #    TARGET_COUNTRY (e.g. reject "Georgia, United States" or "Georgia"
+    #    when TARGET_COUNTRY = "Gabon"). This is checked BEFORE any of the
+    #    expensive company/website crawling or Mistral paraphrasing runs,
+    #    so non-matching jobs are skipped cheaply.
+    if not matches_target_country(location):
+        print(C_RED(f"  ✗ Skipped — location '{location or '(empty)'}' does not "
+                     f"contain TARGET_COUNTRY='{TARGET_COUNTRY}'"))
         return None
 
     time_el    = soup.find("time")
@@ -2878,18 +2872,18 @@ def get_or_create_term(taxonomy_url: str, name: str) -> int | None:
         return None
 
 def post_job_to_wordpress(job: dict) -> tuple:
+    """Post a scraped job to WordPress — with a final country-filter safety
+    check so nothing outside TARGET_COUNTRY can ever be published, even if
+    it somehow slipped past the earlier check in scrape_job_details()."""
     if not WP_USER or not WP_PASSWORD:
         log.warning("WP_USERNAME / WP_APP_PASSWORD not set — skipping WordPress post")
         return None, None
 
-    # ── ▶▶ SAFETY-NET GABON FILTER ─────────────────────────────────────────
-    # Belt-and-suspenders: even though scrape_job_details() already skips
-    # non-Gabon jobs, refuse to post anything to WordPress whose location
-    # doesn't check out, in case this function is ever called with a job
-    # dict from elsewhere.
-    if not is_gabon_location(job.get("jobLocation", "")):
-        log.warning(f"post_job_to_wordpress: refusing non-Gabon job "
-                    f"(location='{job.get('jobLocation','')}'): {job.get('jobTitle','')}")
+    # ▶▶ FINAL COUNTRY-FILTER SAFETY CHECK before publishing
+    location = job.get("jobLocation", "")
+    if not matches_target_country(location):
+        print(C_RED(f"  ✗ NOT posting — location '{location or '(empty)'}' does not "
+                     f"contain TARGET_COUNTRY='{TARGET_COUNTRY}'"))
         return None, None
 
     h = _wp_auth_headers()
@@ -3067,10 +3061,16 @@ def print_job_verbose(job: dict, index: int, total: int):
 # =============================================================================
 
 def _build_guest_api_url(keyword: str, start: int) -> str:
-    kw = quote_plus(keyword)
+    """
+    Build the LinkedIn Guest API search URL. The 'location' query param uses
+    TARGET_COUNTRY, so changing TARGET_COUNTRY at the top of this file is
+    enough to retarget the whole search — nothing else needs editing.
+    """
+    kw       = quote_plus(keyword)
+    location = quote_plus(TARGET_COUNTRY) if TARGET_COUNTRY else ""
     return (
         "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
-        f"?location=Gabon&f_TPR=r604800&keywords={kw}&start={start}"
+        f"?location={location}&f_TPR=r604800&keywords={kw}&start={start}"
     )
 
 def _collect_job_urls_from_cards(html: str, seen: set) -> list:
@@ -3198,12 +3198,16 @@ def craw():
 
     print()
     print(C_HEADER("=" * 72))
-    print(C_HEADER("  LINKEDIN JOB SCRAPER v7 + MISTRAL PARAPHRASE + GABON FILTER"))
+    print(C_HEADER("  LINKEDIN JOB SCRAPER v7 + MISTRAL PARAPHRASE + COUNTRY FILTER"))
     print(C_HEADER("=" * 72))
+    print(f"  🌍 TARGET COUNTRY      : {C_GREEN(TARGET_COUNTRY) if TARGET_COUNTRY else C_DIM('(none — ALL locations)')}")
+    print(f"  🔍 Search location     : {C_GREEN(TARGET_COUNTRY) if TARGET_COUNTRY else C_DIM('(all LinkedIn locations)')}")
+    print(f"  ✅ Posting filter      : {C_GREEN('location text must contain: ' + TARGET_COUNTRY) if TARGET_COUNTRY else C_DIM('(no filtering — posts everything)')}")
+    print(f"  💡 To target another country, edit the single line:")
+    print(f"       TARGET_COUNTRY = \"{TARGET_COUNTRY}\"   near the top of this file")
     print(f"  Keywords      : {len(SEARCH_KEYWORDS)}")
     print(f"  Max pages     : {'unlimited' if not MAX_PAGES else MAX_PAGES} per keyword")
     print(f"  Job cap       : {'none' if not JOB_LIMIT else JOB_LIMIT}")
-    print(f"  Location      : ✅ Gabon-only (rejects US 'GA'/Georgia and other false matches)")
     print(f"  Paraphrase    : {'✅ enabled' if ENABLE_PARAPHRASE else '❌ disabled'} (skipped for Arabic descriptions)")
     print(f"  Apply/Website : ❌ LinkedIn URLs BLOCKED (blanked)")
     print(f"  Company URL   : ✅ LinkedIn company page URL KEPT")
@@ -3211,6 +3215,8 @@ def craw():
     print(f"  Company name  : LinkedIn page > job page > job-card > URL slug > website domain")
     print(f"  Email cleanup : known-TLD truncation (fixes '.comtak' style junk)")
     print(f"  NLP available : {'✅' if _NLP_AVAILABLE else '⚠️  no sentence-transformers / language-tool'}")
+    print(f"  Output file   : {OUTPUT_FILE}")
+    print(f"  Tracker file  : {PROCESSED_IDS_FILE}")
     print(f"  Started       : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(C_HEADER("=" * 72))
 
@@ -3236,7 +3242,7 @@ def craw():
     print(C_HEADER(f"  Total unique URLs collected: {len(all_job_urls)}"))
     print()
 
-    jobs = []; errors = 0; skipped_non_gabon = 0
+    jobs = []; errors = 0; skipped_country = 0
     for j, url in enumerate(all_job_urls):
         print(f"\n{C_HEADER(f'>>> Scraping job {j+1}/{len(all_job_urls)} ...')}")
         log.info(f"URL: {url}")
@@ -3261,12 +3267,13 @@ def craw():
                         mark_posted(job["_jobId"], wp_id, wp_url or "")
                         print(C_GREEN(f"  ✅ WP ID={wp_id}  🔗 {wp_url}"))
                     else:
-                        mark_failed(job["_jobId"], "wp_post_failed")
-                        print(C_RED("  ❌ WordPress post failed"))
+                        mark_failed(job["_jobId"], "wp_post_failed_or_country_mismatch")
+                        print(C_RED("  ❌ WordPress post failed or location filter mismatch"))
+            elif job is None:
+                # Either already-processed, no title, or filtered out by country
+                skipped_country += 1
             else:
-                # scrape_job_details() already prints/logs the reason
-                # (non-Gabon location, no title found, already processed, etc.)
-                pass
+                print(C_RED("  ✗  No title found / skipped"))
         except Exception as e:
             errors += 1
             print(C_RED(f"  ✗  ERROR: {e}"))
@@ -3283,7 +3290,9 @@ def craw():
     print(C_HEADER("=" * 72))
     print(C_HEADER("  SCRAPE COMPLETE"))
     print(C_HEADER("=" * 72))
-    print(f"  {C_LABEL('Total scraped')}  : {C_GREEN(str(len(jobs)))} jobs")
+    print(f"  {C_LABEL('Target country')} : {TARGET_COUNTRY or '(none)'}")
+    print(f"  {C_LABEL('Total posted')}   : {C_GREEN(str(len(jobs)))} jobs")
+    print(f"  {C_LABEL('Skipped')}        : {skipped_country} (already processed / no title / country mismatch)")
     print(f"  {C_LABEL('Errors')}         : {C_RED(str(errors)) if errors else '0'}")
     print(f"  {C_LABEL('Duration')}       : ~{mins} min")
     print(f"  {C_LABEL('Output file')}    : {OUTPUT_FILE}")
