@@ -1,34 +1,55 @@
-name: LinkedIn Job Scraper
+name: LinkedIn Scraper
+
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: '0 */2 * * *'   # runs every 2 hours
   workflow_dispatch:
+
+permissions:
+  contents: write
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    env:
+      WP_BASE_URL:     ${{ secrets.WP_BASE_URL }}
+      WP_USERNAME:     ${{ secrets.WP_USERNAME }}
+      WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
-      - name: Set up Python 3.12
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: "pip"
+          python-version: '3.11'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run scraper
-        env:
-          MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
-          WP_USERNAME:      ${{ secrets.WP_USERNAME }}
-          WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
-          WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
         run: python ga.py
-      - name: Upload Excel output as artifact
-        if: always()
+
+      - name: Upload results as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jobs-output-${{ github.run_id }}
+          name: gabon-jobs-${{ github.run_number }}
           path: |
-            jobs_output.xlsx
-            processed_jobs.csv
-          retention-days: 7
+            jobs_output_gabon.xlsx
+            processed_jobs_gabon.csv
+          retention-days: 30
+
+      # ▶▶ THIS IS THE STEP THAT WAS MISSING — without committing the tracker
+      #    CSV back to the repo, every scheduled run starts with an empty
+      #    processed_jobs_gabon.csv, so already-posted jobs get re-scraped
+      #    and re-paraphrased (and can be posted again under a new slug).
+      - name: Commit tracker file to repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add processed_jobs_gabon.csv
+          git diff --cached --quiet || git commit -m "chore: update Gabon jobs tracker [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+          git push
